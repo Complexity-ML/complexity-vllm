@@ -299,20 +299,32 @@ class TokenRoutedMLP(nn.Module):
             else:
                 expert_ids = base_expert_ids
 
-        # Gather weights for each token's expert
-        gate_up_weights = self.gate_up_proj[expert_ids]  # [num_tokens, H, 2*I]
-        down_weights = self.down_proj[expert_ids]  # [num_tokens, I, H]
+        # Memory-efficient: process by expert groups instead of per-token bmm
+        # This avoids creating huge tensors when indexing weights per token
+        output = torch.zeros(num_tokens, self.hidden_size, device=x.device, dtype=x.dtype)
 
-        # Fused gate+up matmul
-        gate_up_out = torch.bmm(x.unsqueeze(1), gate_up_weights).squeeze(1)  # [num_tokens, 2*I]
+        for expert_id in range(self.num_experts):
+            # Find tokens routed to this expert
+            mask = expert_ids == expert_id
+            if not mask.any():
+                continue
 
-        # Split and apply SwiGLU
-        gate_out = gate_up_out[..., :self.expert_intermediate_size]
-        up_out = gate_up_out[..., self.expert_intermediate_size:]
-        intermediate = F.silu(gate_out) * up_out  # [num_tokens, I]
+            # Get tokens for this expert
+            x_expert = x[mask]  # [num_tokens_for_expert, hidden_size]
 
-        # Down projection
-        output = torch.bmm(intermediate.unsqueeze(1), down_weights).squeeze(1)  # [num_tokens, H]
+            # Get expert weights (single expert, not per-token copy)
+            gate_up_w = self.gate_up_proj[expert_id]  # [hidden_size, 2*intermediate]
+            down_w = self.down_proj[expert_id]  # [intermediate, hidden_size]
+
+            # Forward through expert (matmul instead of bmm - much more memory efficient)
+            gate_up_out = x_expert @ gate_up_w  # [n, 2*intermediate]
+            gate_out = gate_up_out[..., :self.expert_intermediate_size]
+            up_out = gate_up_out[..., self.expert_intermediate_size:]
+            intermediate = F.silu(gate_out) * up_out  # [n, intermediate]
+            expert_output = intermediate @ down_w  # [n, hidden_size]
+
+            # Scatter back to output
+            output[mask] = expert_output
 
         return output
 
@@ -788,3 +800,8 @@ class ComplexityForCausalLM(nn.Module):
                 loaded_params.add(name)
 
         return loaded_params
+
+
+# Alias for HuggingFace compatibility
+# The model on HuggingFace uses "DeepForCausalLM" as architecture name
+DeepForCausalLM = ComplexityForCausalLM

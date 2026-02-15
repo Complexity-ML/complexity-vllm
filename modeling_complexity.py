@@ -40,6 +40,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.layers.token_routed_i64 import TokenRoutedMLP
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -206,127 +207,6 @@ class ComplexityMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
-
-class TokenRoutedMLP(nn.Module):
-    """
-    Token-Routed MLP - Deterministic expert routing with optional mu-guidance.
-
-    Routes tokens to experts based on: expert_id = token_id % num_experts
-    With mu-guidance: expert_id can be influenced by mu through mu_router.
-
-    No router network needed (deterministic), no load balancing loss.
-
-    Weight format (matches complexity-inference exactly):
-    - intermediate_size is TOTAL, divided by num_experts for per-expert size
-    - Uses fused gate_up_proj: [num_experts, hidden_size, 2 * expert_intermediate]
-    - down_proj: [num_experts, expert_intermediate, hidden_size]
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int,
-        vocab_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_experts = num_experts
-        self.vocab_size = vocab_size
-
-        # Per-expert intermediate size (total intermediate / num_experts)
-        self.expert_intermediate_size = intermediate_size // num_experts
-
-        # Fused gate+up projection: [num_experts, hidden_size, 2 * expert_intermediate]
-        # First half is gate, second half is up (matches complexity-inference)
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, 2 * self.expert_intermediate_size)
-        )
-        # Down projection: [num_experts, expert_intermediate, hidden_size]
-        self.down_proj = nn.Parameter(
-            torch.empty(num_experts, self.expert_intermediate_size, hidden_size)
-        )
-
-        # Mu-guided routing (optional override of token-based routing)
-        self.mu_router = nn.Linear(hidden_size, num_experts, bias=False)
-        nn.init.zeros_(self.mu_router.weight)  # Start neutral
-
-        # Token to expert mapping buffer
-        self.register_buffer(
-            "token_to_expert",
-            torch.arange(vocab_size, dtype=torch.long) % num_experts,
-        )
-
-        # Initialize expert weights
-        nn.init.kaiming_uniform_(self.gate_up_proj, a=5**0.5)
-        nn.init.kaiming_uniform_(self.down_proj, a=5**0.5)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_ids: Optional[torch.Tensor] = None,
-        mu: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: [num_tokens, hidden_size]
-            token_ids: [num_tokens] - used for deterministic routing
-            mu: [num_tokens, hidden_size] - optional mu for guided routing
-
-        Routing logic (matches complexity-inference exactly):
-            1. Base routing: expert_id = token_id % num_experts
-            2. If mu provided: mu_logits bias the selection (hard argmax)
-        """
-        num_tokens = x.shape[0]
-
-        # Determine expert assignment
-        if token_ids is None:
-            expert_ids = torch.zeros(num_tokens, dtype=torch.long, device=x.device)
-        else:
-            token_ids_clamped = token_ids.clamp(0, self.vocab_size - 1)
-            base_expert_ids = self.token_to_expert.to(x.device)[token_ids_clamped]
-
-            # Mu-guided routing (matches complexity-inference)
-            if mu is not None:
-                mu_logits = self.mu_router(mu)  # [num_tokens, num_experts]
-                # Combine: strong base routing (10.0) + mu influence
-                base_one_hot = F.one_hot(base_expert_ids, self.num_experts).float()
-                combined_logits = base_one_hot * 10.0 + mu_logits
-                expert_ids = combined_logits.argmax(dim=-1)
-            else:
-                expert_ids = base_expert_ids
-
-        # Memory-efficient: process by expert groups instead of per-token bmm
-        # This avoids creating huge tensors when indexing weights per token
-        output = torch.zeros(num_tokens, self.hidden_size, device=x.device, dtype=x.dtype)
-
-        for expert_id in range(self.num_experts):
-            # Find tokens routed to this expert
-            mask = expert_ids == expert_id
-            if not mask.any():
-                continue
-
-            # Get tokens for this expert
-            x_expert = x[mask]  # [num_tokens_for_expert, hidden_size]
-
-            # Get expert weights (single expert, not per-token copy)
-            gate_up_w = self.gate_up_proj[expert_id]  # [hidden_size, 2*intermediate]
-            down_w = self.down_proj[expert_id]  # [intermediate, hidden_size]
-
-            # Forward through expert (matmul instead of bmm - much more memory efficient)
-            gate_up_out = x_expert @ gate_up_w  # [n, 2*intermediate]
-            gate_out = gate_up_out[..., :self.expert_intermediate_size]
-            up_out = gate_up_out[..., self.expert_intermediate_size:]
-            intermediate = F.silu(gate_out) * up_out  # [n, intermediate]
-            expert_output = intermediate @ down_w  # [n, hidden_size]
-
-            # Scatter back to output
-            output[mask] = expert_output
-
-        return output
 
 
 class ComplexityAttention(nn.Module):
@@ -524,7 +404,6 @@ class ComplexityDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 num_experts=getattr(config, "num_experts", 4),
                 vocab_size=config.vocab_size,
-                quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -768,14 +647,22 @@ class ComplexityForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            # Handle Token-Routed MLP weights
-            if "mlp.gate_proj" in name or "mlp.up_proj" in name or "mlp.down_proj" in name:
-                # These are expert weights, load directly
+            orig_name = name
+
+            # Handle Token-Routed MLP weights via I64 layer TP-aware loading
+            if ".mlp.gate_up_proj" in name or ".mlp.down_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                    parts = name.split(".")
+                    layer_idx = int(parts[2])
+                    mlp = self.model.layers[layer_idx].mlp
+                    param_name = parts[-1]  # "gate_up_proj" or "down_proj"
+                    if isinstance(mlp, TokenRoutedMLP):
+                        mlp.load_tp_weight(param_name, param, loaded_weight)
+                    else:
+                        with torch.no_grad():
+                            param.copy_(loaded_weight)
+                    loaded_params.add(orig_name)
                 continue
 
             # Handle stacked params (QKV, gate_up)

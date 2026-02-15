@@ -23,11 +23,13 @@ from .modeling_complexity import (
     ComplexityDecoderLayer,
     ComplexityAttention,
     ComplexityMLP,
-    TokenRoutedMLP,
     INLDynamics,
     soft_clamp,
     mu_clamp,
 )
+
+# TokenRoutedMLP is now a vLLM layer (PR #34559)
+from vllm.model_executor.layers.token_routed_i64 import TokenRoutedMLP
 
 __all__ = [
     "ComplexityConfig",
